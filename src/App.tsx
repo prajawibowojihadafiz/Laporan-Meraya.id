@@ -31,6 +31,7 @@ import { PhotoSection } from './components/PhotoSection';
 import { NotesSection } from './components/NotesSection';
 import { MonthlyOverviewSection } from './components/MonthlyOverviewSection';
 import { SettingsModal } from './components/SettingsModal';
+import { ResetAllModal } from './components/ResetAllModal';
 import { WhatsAppPreviewModal } from './components/WhatsAppPreviewModal';
 import { PdfReportTemplate } from './components/PdfReportTemplate';
 import { PdfMonthlyReportTemplate } from './components/PdfMonthlyReportTemplate';
@@ -38,6 +39,13 @@ import { LoginScreen } from './components/LoginScreen';
 import { LogoutModal } from './components/LogoutModal';
 import { AUTH_STORAGE_KEY, clearAuthSession, setAuthSession } from './utils/auth';
 import { exportReportToPdf } from './utils/pdfExport';
+import {
+  saveDayReportToFirestore,
+  subscribeToAllReports,
+  saveSettingsToFirestore,
+  subscribeToSettings,
+  resetAllFirestoreReports,
+} from './firebase';
 import {
   Order,
   Income,
@@ -160,14 +168,17 @@ export default function App() {
   const [isWhatsAppModalOpen, setIsWhatsAppModalOpen] = useState(false);
   const [isLogoutModalOpen, setIsLogoutModalOpen] = useState(false);
   const [isResetConfirmModalOpen, setIsResetConfirmModalOpen] = useState(false);
+  const [isResetAllModalOpen, setIsResetAllModalOpen] = useState(false);
+  const [isResettingAll, setIsResettingAll] = useState(false);
   const [isGeneratingPdf, setIsGeneratingPdf] = useState(false);
+  const [syncStatus, setSyncStatus] = useState<'synced' | 'syncing' | 'offline'>('synced');
   const [toastMessage, setToastMessage] = useState<string | null>(null);
 
   const customFrameSectionRef = useRef<HTMLDivElement>(null);
   const pdfDailyTemplateRef = useRef<HTMLDivElement>(null);
   const pdfMonthlyTemplateRef = useRef<HTMLDivElement>(null);
 
-  // Persistence
+  // Persistence to LocalStorage
   useEffect(() => {
     localStorage.setItem(`${STORAGE_KEY}_settings`, JSON.stringify(settings));
   }, [settings]);
@@ -175,6 +186,47 @@ export default function App() {
   useEffect(() => {
     localStorage.setItem(`${STORAGE_KEY}_reports_map`, JSON.stringify(reportsMap));
   }, [reportsMap]);
+
+  // Real-time Firebase Cloud Synchronization
+  useEffect(() => {
+    // 1. Subscribe to all reports in real time from Firestore
+    // When Cashier on mobile adds/updates an order or checklist, Laptop Owner sees it live!
+    const unsubscribeReports = subscribeToAllReports(
+      (remoteMap) => {
+        if (remoteMap && Object.keys(remoteMap).length > 0) {
+          setReportsMap((prev) => ({
+            ...prev,
+            ...remoteMap,
+          }));
+        }
+        setSyncStatus('synced');
+      },
+      (err) => {
+        console.warn('Firebase sync status:', err);
+        setSyncStatus('offline');
+      }
+    );
+
+    // 2. Subscribe to booth settings from Firestore
+    const unsubscribeSettings = subscribeToSettings(
+      (remoteSettings) => {
+        if (remoteSettings && remoteSettings.boothName) {
+          setSettings((prev) => ({
+            ...prev,
+            ...remoteSettings,
+          }));
+        }
+      },
+      () => {
+        // silent fallback to local settings
+      }
+    );
+
+    return () => {
+      unsubscribeReports();
+      unsubscribeSettings();
+    };
+  }, []);
 
   const showToast = (msg: string) => {
     setToastMessage(msg);
@@ -200,8 +252,9 @@ export default function App() {
     showToast('Anda telah keluar dari sistem.');
   };
 
-  // Helper to mutate current day's report
+  // Helper to mutate current day's report and push in real-time to Firestore
   const updateCurrentDay = (updater: (prev: DayReportData) => DayReportData) => {
+    setSyncStatus('syncing');
     setReportsMap((prevMap) => {
       const existing = prevMap[selectedDate] || {
         date: selectedDate,
@@ -216,6 +269,16 @@ export default function App() {
         notes: '',
       };
       const updated = updater(existing);
+
+      // Asynchronously sync to Firebase Firestore for cross-device real-time sync
+      saveDayReportToFirestore(updated)
+        .then((ok) => {
+          setSyncStatus(ok ? 'synced' : 'offline');
+        })
+        .catch(() => {
+          setSyncStatus('offline');
+        });
+
       return {
         ...prevMap,
         [selectedDate]: updated,
@@ -417,6 +480,59 @@ export default function App() {
     showToast('Data tanggal ini telah direset!');
   };
 
+  // Reset ALL Data (Factory Reset: Local & Cloud Firebase)
+  const handleOpenResetAllModal = () => {
+    setIsSettingsOpen(false);
+    setIsResetAllModalOpen(true);
+  };
+
+  const handleConfirmResetAll = async (options: { resetSettings: boolean }) => {
+    setIsResettingAll(true);
+    setSyncStatus('syncing');
+    showToast('Sedang mereset seluruh data (Lokal & Cloud Firebase)...');
+
+    try {
+      // 1. Delete all reports from Firestore
+      await resetAllFirestoreReports();
+
+      // 2. Clear localStorage reports
+      localStorage.removeItem(`${STORAGE_KEY}_reports_map`);
+
+      // 3. Reset local state to a fresh blank report for today
+      const freshToday: DayReportData = {
+        date: todayKey,
+        orders: [],
+        customFrames: [],
+        incomes: [],
+        boothCondition: DEFAULT_BOOTH_CONDITION,
+        stockCondition: DEFAULT_STOCK_CONDITION,
+        issues: [],
+        purchases: [],
+        photos: [],
+        notes: '',
+      };
+      setReportsMap({ [todayKey]: freshToday });
+      setSelectedDate(todayKey);
+
+      // 4. Optionally reset settings to default
+      if (options.resetSettings) {
+        localStorage.removeItem(`${STORAGE_KEY}_settings`);
+        setSettings(DEFAULT_SETTINGS);
+        await saveSettingsToFirestore(DEFAULT_SETTINGS);
+      }
+
+      setSyncStatus('synced');
+      setIsResetAllModalOpen(false);
+      showToast('Seluruh data berhasil direset bersih (Lokal & Cloud Firebase)!');
+    } catch (error) {
+      console.error('Reset all error:', error);
+      showToast('Sebagian data lokal berhasil direset. Periksa koneksi cloud.');
+      setIsResetAllModalOpen(false);
+    } finally {
+      setIsResettingAll(false);
+    }
+  };
+
   // Export Daily PDF
   const handleExportDailyPdf = async () => {
     if (!pdfDailyTemplateRef.current) return;
@@ -544,6 +660,7 @@ export default function App() {
           isGeneratingPdf={isGeneratingPdf}
           loggedInUser={loggedInUser}
           onLogout={handleLogout}
+          syncStatus={syncStatus}
         />
 
         {/* Hero Card: Inspired directly by "Current Limit / Welcome Back" Card in Reference Screens */}
@@ -776,9 +893,22 @@ export default function App() {
         settings={settings}
         onSaveSettings={(newSettings) => {
           setSettings(newSettings);
+          setSyncStatus('syncing');
+          saveSettingsToFirestore(newSettings).then((ok) => {
+            setSyncStatus(ok ? 'synced' : 'offline');
+          });
           showToast('Pengaturan photobooth disimpan!');
         }}
         onResetDay={handleOpenResetModal}
+        onResetAllData={handleOpenResetAllModal}
+      />
+
+      {/* Reset All Data (Factory Reset) Confirmation Modal */}
+      <ResetAllModal
+        isOpen={isResetAllModalOpen}
+        onClose={() => setIsResetAllModalOpen(false)}
+        onConfirmResetAll={handleConfirmResetAll}
+        isResetting={isResettingAll}
       />
 
       {/* Logout Confirmation Modal */}
